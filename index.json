@@ -166,6 +166,7 @@ class VmessChunkDecoder {
     this.shake = (this.masking || this.padding) ? makeShake128(iv16) : null;
     this.buf = Buffer.alloc(0);
     this.done = false;
+    this.pendingChunk = null; // { sizeLen, padLen, size } bila header chunk sudah dibaca tapi bodi belum lengkap
   }
   // Masukkan bytes mentah; kembalikan { plains: Buffer[], done: bool }
   push(data) {
@@ -175,24 +176,30 @@ class VmessChunkDecoder {
     for (;;) {
       const sizeLen = this.authLen ? 18 : 2;
       if (this.buf.length < sizeLen) break;
-      const sizeBytes = this.buf.slice(0, sizeLen);
-      let padLen = 0, size;
-      try {
-        if (this.padding) padLen = this.shake.nextU16() % 64;
-        if (this.authLen) {
-          const raw = vmessAeadOpen(this.cipher, this.lenKey, this.lenNonceGen(), sizeBytes);
-          size = raw.readUInt16BE(0) + 16;
-        } else if (this.masking) {
-          size = (this.shake.nextU16() ^ sizeBytes.readUInt16BE(0)) & 0xffff;
-        } else {
-          size = sizeBytes.readUInt16BE(0);
-        }
-      } catch (e) { throw new Error("Decode ukuran chunk VMess gagal: " + e.message); }
-      if (size === 16 + padLen) { this.done = true; this.buf = this.buf.slice(sizeLen); break; } // sinyal terminasi
+      // Undian SHAKE tepat sekali per chunk: simpan bila bodi belum lengkap.
+      if (this.pendingChunk === null) {
+        const sizeBytes = this.buf.slice(0, sizeLen);
+        let padLen = 0, size;
+        try {
+          if (this.padding) padLen = this.shake.nextU16() % 64;
+          if (this.authLen) {
+            const raw = vmessAeadOpen(this.cipher, this.lenKey, this.lenNonceGen(), sizeBytes);
+            size = raw.readUInt16BE(0) + 16;
+          } else if (this.masking) {
+            size = (this.shake.nextU16() ^ sizeBytes.readUInt16BE(0)) & 0xffff;
+          } else {
+            size = sizeBytes.readUInt16BE(0);
+          }
+        } catch (e) { throw new Error("Decode ukuran chunk VMess gagal: " + e.message); }
+        this.pendingChunk = { sizeLen, padLen, size };
+      }
+      const { sizeLen: sl, padLen, size } = this.pendingChunk;
+      if (size === 16 + padLen) { this.done = true; this.buf = this.buf.slice(sl); this.pendingChunk = null; break; } // sinyal terminasi
       if (size < 16 + padLen) throw new Error("Ukuran chunk VMess invalid: " + size);
-      if (this.buf.length < sizeLen + size) break; // tunggu bytes lengkap
-      const sealed = this.buf.slice(sizeLen, sizeLen + size - padLen);
-      this.buf = this.buf.slice(sizeLen + size);
+      if (this.buf.length < sl + size) break; // tunggu bytes lengkap
+      this.pendingChunk = null;
+      const sealed = this.buf.slice(sl, sl + size - padLen);
+      this.buf = this.buf.slice(sl + size);
       let plain;
       try { plain = vmessAeadOpen(this.cipher, this.key, this.nonceGen(), sealed); }
       catch (e) { throw new Error("Dekripsi body VMess gagal: " + e.message); }
